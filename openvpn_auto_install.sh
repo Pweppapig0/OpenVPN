@@ -3,6 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 API_SOURCE="${SCRIPT_DIR}/openvpn_manager_api.py"
+REMOTE_API_SOURCE_URL="${OPENVPN_MANAGER_API_URL:-https://raw.githubusercontent.com/Pweppapig0/OpenVPN/main/openvpn_manager_api.py}"
+DOWNLOADED_API_SOURCE=""
 
 abort() {
     echo "Error: $*" >&2
@@ -34,9 +36,32 @@ need_fresh_install_target() {
 }
 
 need_local_assets() {
-    if [[ ! -f "${API_SOURCE}" ]]; then
-        abort "Missing ${API_SOURCE}. Run the installer from the extension folder so it can copy the API service."
+    if [[ -f "${API_SOURCE}" ]]; then
+        return 0
     fi
+
+    if [[ -z "${REMOTE_API_SOURCE_URL}" ]]; then
+        abort "Missing ${API_SOURCE} and no remote fallback URL was configured."
+    fi
+
+    DOWNLOADED_API_SOURCE="$(mktemp /tmp/paymenter-openvpn-manager-api.XXXXXX.py)"
+
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "${REMOTE_API_SOURCE_URL}" -o "${DOWNLOADED_API_SOURCE}" || \
+            abort "Failed to download openvpn_manager_api.py from ${REMOTE_API_SOURCE_URL}"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "${DOWNLOADED_API_SOURCE}" "${REMOTE_API_SOURCE_URL}" || \
+            abort "Failed to download openvpn_manager_api.py from ${REMOTE_API_SOURCE_URL}"
+    else
+        abort "Neither curl nor wget is installed, so the companion API file cannot be downloaded automatically."
+    fi
+
+    if [[ ! -s "${DOWNLOADED_API_SOURCE}" ]]; then
+        abort "Downloaded companion API file is empty: ${REMOTE_API_SOURCE_URL}"
+    fi
+
+    API_SOURCE="${DOWNLOADED_API_SOURCE}"
+    echo "Downloaded companion API file from ${REMOTE_API_SOURCE_URL}"
 }
 
 ask_default() {
@@ -538,7 +563,9 @@ echo
 echo "Preparing packages and filesystem..."
 prepare_packages
 
-install -d -m 750 /var/www/html
+install -d -m 755 /var/www/html
+install -d -m 755 /var/www/html/.well-known
+install -d -m 755 /var/www/html/.well-known/acme-challenge
 write_manager_assets
 write_manager_config
 configure_sysctl
@@ -559,5 +586,9 @@ fi
 systemctl restart openvpn-server@server.service
 systemctl restart paymenter-openvpn-api.service
 systemctl restart nginx
+
+if [[ -n "${DOWNLOADED_API_SOURCE}" && -f "${DOWNLOADED_API_SOURCE}" ]]; then
+    rm -f "${DOWNLOADED_API_SOURCE}"
+fi
 
 print_summary
