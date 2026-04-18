@@ -238,6 +238,7 @@ write_manager_config() {
     local dns_json
     dns_json="$(split_csv_to_json "${DEFAULT_DNS_SERVERS}")"
 
+    install -d -m 755 /etc/paymenter-openvpn-manager
     cat > /etc/paymenter-openvpn-manager/config.json <<EOF
 {
   "api_token": "${API_TOKEN}",
@@ -265,14 +266,26 @@ write_manager_config() {
 }
 EOF
 
-    chmod 640 /etc/paymenter-openvpn-manager/config.json
+    chown root:root /etc/paymenter-openvpn-manager
+    chmod 755 /etc/paymenter-openvpn-manager
+    chown root:root /etc/paymenter-openvpn-manager/config.json
+    chmod 644 /etc/paymenter-openvpn-manager/config.json
 }
 
 write_manager_assets() {
-    install -d -m 750 /etc/paymenter-openvpn-manager /opt/paymenter-openvpn-manager /var/lib/paymenter-openvpn-manager /etc/openvpn/server/ccd
+    install -d -m 755 /etc/paymenter-openvpn-manager /opt/paymenter-openvpn-manager /var/lib/paymenter-openvpn-manager /etc/openvpn/server/ccd
     install -m 755 "${API_SOURCE}" /opt/paymenter-openvpn-manager/openvpn_manager_api.py
     touch /var/lib/paymenter-openvpn-manager/ipp.txt
     touch /var/lib/paymenter-openvpn-manager/openvpn-status.log
+    chmod 755 /etc/openvpn
+    chmod 755 /opt/paymenter-openvpn-manager
+    chmod 755 /etc/openvpn/server
+    chown root:root /etc/openvpn/server/ccd
+    chmod 755 /etc/openvpn/server/ccd
+    chown root:nogroup /var/lib/paymenter-openvpn-manager
+    chmod 2775 /var/lib/paymenter-openvpn-manager
+    chown root:nogroup /var/lib/paymenter-openvpn-manager/ipp.txt /var/lib/paymenter-openvpn-manager/openvpn-status.log
+    chmod 664 /var/lib/paymenter-openvpn-manager/ipp.txt /var/lib/paymenter-openvpn-manager/openvpn-status.log
 
     cat > /opt/paymenter-openvpn-manager/client-connect.sh <<'EOF'
 #!/usr/bin/env bash
@@ -307,6 +320,36 @@ WantedBy=multi-user.target
 EOF
 }
 
+initialize_manager_state() {
+    /usr/bin/python3 /opt/paymenter-openvpn-manager/openvpn_manager_api.py init-db
+
+    chown root:root /etc/openvpn/server/ccd
+    chmod 755 /etc/openvpn/server/ccd
+    find /etc/openvpn/server/ccd -maxdepth 1 -type f -exec chown root:root {} \;
+    find /etc/openvpn/server/ccd -maxdepth 1 -type f -exec chmod 644 {} \;
+
+    chown root:nogroup /var/lib/paymenter-openvpn-manager
+    chmod 2775 /var/lib/paymenter-openvpn-manager
+    chown root:nogroup /var/lib/paymenter-openvpn-manager/manager.db
+    chmod 664 /var/lib/paymenter-openvpn-manager/manager.db
+    chown root:nogroup /var/lib/paymenter-openvpn-manager/ipp.txt
+    chmod 664 /var/lib/paymenter-openvpn-manager/ipp.txt
+    chown root:nogroup /var/lib/paymenter-openvpn-manager/openvpn-status.log
+    chmod 664 /var/lib/paymenter-openvpn-manager/openvpn-status.log
+
+    if compgen -G "/var/lib/paymenter-openvpn-manager/manager.db*" > /dev/null; then
+        chown root:nogroup /var/lib/paymenter-openvpn-manager/manager.db*
+        chmod 664 /var/lib/paymenter-openvpn-manager/manager.db*
+    fi
+
+    chown root:root /etc/openvpn/server/crl.pem
+    chmod 644 /etc/openvpn/server/crl.pem
+    chown root:root /etc/paymenter-openvpn-manager
+    chmod 755 /etc/paymenter-openvpn-manager
+    chown root:root /etc/paymenter-openvpn-manager/config.json
+    chmod 644 /etc/paymenter-openvpn-manager/config.json
+}
+
 configure_sysctl() {
     cat > /etc/sysctl.d/99-paymenter-openvpn.conf <<EOF
 net.ipv4.ip_forward = 1
@@ -337,6 +380,8 @@ configure_ufw() {
     ufw allow 80/tcp
     ufw allow 443/tcp
     ufw allow "${OPENVPN_PORT}/${OPENVPN_PROTOCOL}"
+    ufw route allow in on tun0 out on "${PUBLIC_NIC}"
+    ufw route allow in on "${PUBLIC_NIC}" out on tun0
     ufw --force enable
 }
 
@@ -345,6 +390,10 @@ configure_iptables_persistent() {
 
     iptables -t nat -C POSTROUTING -s "${VPN_SUBNET}" -o "${PUBLIC_NIC}" -j MASQUERADE 2>/dev/null || \
         iptables -t nat -A POSTROUTING -s "${VPN_SUBNET}" -o "${PUBLIC_NIC}" -j MASQUERADE
+    iptables -C FORWARD -i tun0 -s "${VPN_SUBNET}" -o "${PUBLIC_NIC}" -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i tun0 -s "${VPN_SUBNET}" -o "${PUBLIC_NIC}" -j ACCEPT
+    iptables -C FORWARD -i "${PUBLIC_NIC}" -d "${VPN_SUBNET}" -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+        iptables -A FORWARD -i "${PUBLIC_NIC}" -d "${VPN_SUBNET}" -o tun0 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 
     iptables -C INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport "${SSH_PORT}" -j ACCEPT
     iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -A INPUT -p tcp --dport 80 -j ACCEPT
@@ -568,6 +617,7 @@ install -d -m 755 /var/www/html/.well-known
 install -d -m 755 /var/www/html/.well-known/acme-challenge
 write_manager_assets
 write_manager_config
+initialize_manager_state
 configure_sysctl
 setup_easy_rsa
 write_openvpn_server_config

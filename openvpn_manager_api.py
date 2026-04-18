@@ -21,6 +21,27 @@ CONFIG_PATH = Path(os.environ.get("PAYMENTER_OPENVPN_CONFIG", "/etc/paymenter-op
 app = Flask(__name__)
 
 
+def ensure_permissions(path: Path, mode: int, directory: bool = False) -> None:
+    if not path.exists():
+        return
+
+    try:
+        os.chmod(path, mode)
+    except PermissionError:
+        pass
+
+    if directory:
+        try:
+            current_mode = path.stat().st_mode & 0o7777
+        except PermissionError:
+            return
+        if current_mode != mode:
+            try:
+                os.chmod(path, mode)
+            except PermissionError:
+                pass
+
+
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
@@ -43,8 +64,10 @@ def db_path() -> Path:
 def connect_db() -> sqlite3.Connection:
     path = db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_permissions(path.parent, 0o2775, directory=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    ensure_permissions(path, 0o664)
     return conn
 
 
@@ -309,8 +332,26 @@ def write_ccd(common_name: str, dns_servers: list[str], redirect_gateway: bool, 
 
     target = ccd_path(common_name)
     target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_permissions(target.parent, 0o755, directory=True)
     target.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    os.chmod(target, 0o640)
+    ensure_permissions(target, 0o644)
+
+
+def row_dns_servers(row: dict, cfg: dict) -> list[str]:
+    dns_servers = json_list(row.get("dns_servers"))
+    if dns_servers:
+        return dns_servers
+    return json_list(cfg.get("default_dns_servers"))
+
+
+def row_route_networks(row: dict) -> list[str]:
+    return json_list(row.get("route_networks"))
+
+
+def row_redirect_gateway(row: dict, cfg: dict) -> bool:
+    if "redirect_gateway" in row:
+        return bool_from_value(row.get("redirect_gateway"), True)
+    return bool_from_value(cfg.get("default_redirect_gateway"), True)
 
 
 def build_client_config(common_name: str, row: dict) -> str:
@@ -319,15 +360,21 @@ def build_client_config(common_name: str, row: dict) -> str:
     cert_text = cert_path(common_name).read_text(encoding="utf-8").strip()
     key_text = key_path(common_name).read_text(encoding="utf-8").strip()
     tls_crypt_text = Path(cfg["tls_crypt_path"]).read_text(encoding="utf-8").strip()
+    redirect_gateway = row_redirect_gateway(row, cfg)
+    dns_servers = row_dns_servers(row, cfg)
+    route_networks = row_route_networks(row)
 
     lines = [
         "client",
         "dev tun",
+        "topology subnet",
         f"proto {cfg['protocol']}",
         f"remote {cfg['public_host']} {cfg['port']}",
         "nobind",
         "persist-key",
         "persist-tun",
+        "pull",
+        "route-delay 5",
         "resolv-retry infinite",
         "remote-cert-tls server",
         "auth-nocache",
@@ -336,21 +383,36 @@ def build_client_config(common_name: str, row: dict) -> str:
         f"data-ciphers {cfg['data_ciphers']}",
         f"auth {cfg['auth']}",
         "key-direction 1",
-        "",
-        "<ca>",
-        ca_text,
-        "</ca>",
-        "<cert>",
-        cert_text,
-        "</cert>",
-        "<key>",
-        key_text,
-        "</key>",
-        "<tls-crypt>",
-        tls_crypt_text,
-        "</tls-crypt>",
-        "",
     ]
+
+    if redirect_gateway:
+        lines.append("redirect-gateway def1 bypass-dhcp")
+
+    for dns in dns_servers:
+        lines.append(f"dhcp-option DNS {dns}")
+
+    for cidr in route_networks:
+        network = ipaddress.ip_network(cidr, strict=False)
+        lines.append(f"route {network.network_address} {network.netmask}")
+
+    lines.extend(
+        [
+            "",
+            "<ca>",
+            ca_text,
+            "</ca>",
+            "<cert>",
+            cert_text,
+            "</cert>",
+            "<key>",
+            key_text,
+            "</key>",
+            "<tls-crypt>",
+            tls_crypt_text,
+            "</tls-crypt>",
+            "",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -381,18 +443,17 @@ def disconnect_active_client(common_name: str) -> None:
         pass
 
 
-def parse_status() -> dict[str, dict]:
-    cfg = load_config()
-    status_file = Path(cfg.get("status_file", "/var/lib/paymenter-openvpn-manager/openvpn-status.log"))
-    if not status_file.exists():
+def parse_status_text(status_text: str) -> dict[str, dict]:
+    if not status_text.strip():
         return {}
 
     headers = {}
     sessions = {}
-    for raw_line in status_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+    for raw_line in status_text.splitlines():
         line = raw_line.strip()
         if not line:
             continue
+
         parts = line.split(",")
         if len(parts) < 2:
             continue
@@ -410,7 +471,7 @@ def parse_status() -> dict[str, dict]:
         for idx, column in enumerate(columns):
             row[column] = values[idx] if idx < len(values) else ""
 
-        common_name = str(row.get("Common Name", "")).strip()
+        common_name = str(row.get("Common Name", "") or row.get("Common name", "")).strip()
         if not common_name:
             continue
 
@@ -426,13 +487,52 @@ def parse_status() -> dict[str, dict]:
             },
         )
 
-        current["bytes_received"] += int(row.get("Bytes Received", "0") or 0)
-        current["bytes_sent"] += int(row.get("Bytes Sent", "0") or 0)
-        current["connected_since"] = row.get("Connected Since") or current["connected_since"]
-        current["remote_address"] = row.get("Real Address") or current["remote_address"]
-        current["virtual_address"] = row.get("Virtual Address") or row.get("Virtual IPv6 Address") or current["virtual_address"]
+        try:
+            current["bytes_received"] += int(row.get("Bytes Received", "0") or 0)
+        except ValueError:
+            pass
+        try:
+            current["bytes_sent"] += int(row.get("Bytes Sent", "0") or 0)
+        except ValueError:
+            pass
+
+        connected_since = row.get("Connected Since")
+        if connected_since:
+            current["connected_since"] = connected_since
+
+        remote_address = row.get("Real Address") or row.get("Real address")
+        if remote_address:
+            current["remote_address"] = remote_address
+
+        virtual_address = (
+            row.get("Virtual Address")
+            or row.get("Virtual IPv4 Address")
+            or row.get("Virtual IPv6 Address")
+            or row.get("Virtual address")
+        )
+        if virtual_address:
+            current["virtual_address"] = virtual_address
 
     return sessions
+
+
+def parse_status() -> dict[str, dict]:
+    try:
+        management_status = management_command("status 3")
+        sessions = parse_status_text(management_status)
+        if sessions:
+            return sessions
+    except OSError:
+        pass
+    except Exception:
+        pass
+
+    cfg = load_config()
+    status_file = Path(cfg.get("status_file", "/var/lib/paymenter-openvpn-manager/openvpn-status.log"))
+    if not status_file.exists():
+        return {}
+
+    return parse_status_text(status_file.read_text(encoding="utf-8", errors="ignore"))
 
 
 def usage_payload(row: sqlite3.Row) -> dict:
@@ -441,6 +541,21 @@ def usage_payload(row: sqlite3.Row) -> dict:
     live = live_sessions.get(data["common_name"], {})
     download_bytes = int(data["total_bytes_received"] or 0) + int(live.get("bytes_received") or 0)
     upload_bytes = int(data["total_bytes_sent"] or 0) + int(live.get("bytes_sent") or 0)
+    last_connected_at = data.get("last_connected_at")
+    last_disconnected_at = data.get("last_disconnected_at")
+
+    optimistic_connected = False
+    if not live and last_connected_at:
+        try:
+            connected_dt = datetime.fromisoformat(str(last_connected_at).replace("Z", "+00:00"))
+            disconnected_dt = None
+            if last_disconnected_at:
+                disconnected_dt = datetime.fromisoformat(str(last_disconnected_at).replace("Z", "+00:00"))
+
+            if disconnected_dt is None or connected_dt > disconnected_dt:
+                optimistic_connected = True
+        except ValueError:
+            optimistic_connected = False
 
     return {
         "id": data["id"],
@@ -451,8 +566,8 @@ def usage_payload(row: sqlite3.Row) -> dict:
         "download_name": data["download_name"],
         "download_bytes": download_bytes,
         "upload_bytes": upload_bytes,
-        "connected": bool(live),
-        "connected_since": live.get("connected_since"),
+        "connected": bool(live) or optimistic_connected,
+        "connected_since": live.get("connected_since") or last_connected_at,
         "remote_address": live.get("remote_address"),
         "virtual_address": live.get("virtual_address"),
         "disabled": data["disabled"],
