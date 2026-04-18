@@ -6,6 +6,14 @@ API_SOURCE="${SCRIPT_DIR}/openvpn_manager_api.py"
 REMOTE_API_SOURCE_URL="${OPENVPN_MANAGER_API_URL:-https://raw.githubusercontent.com/Pweppapig0/OpenVPN/main/openvpn_manager_api.py}"
 DOWNLOADED_API_SOURCE=""
 
+cleanup() {
+    if [[ -n "${DOWNLOADED_API_SOURCE}" && -f "${DOWNLOADED_API_SOURCE}" ]]; then
+        rm -f "${DOWNLOADED_API_SOURCE}"
+    fi
+}
+
+trap cleanup EXIT
+
 abort() {
     echo "Error: $*" >&2
     exit 1
@@ -30,13 +38,15 @@ need_ubuntu_2204() {
 }
 
 need_fresh_install_target() {
-    if [[ -e /etc/openvpn/server/server.conf || -d /etc/paymenter-openvpn-manager || -d /etc/openvpn/easy-rsa/pki ]]; then
+    if [[ -e /etc/openvpn/server/server.conf || -d /etc/paymenter-openvpn-manager || -d /etc/openvpn/easy-rsa/pki || -d /opt/paymenter-openvpn-manager || -d /var/lib/paymenter-openvpn-manager ]]; then
         abort "Existing OpenVPN manager files were detected. Use a fresh host or clean the previous installation first."
     fi
 }
 
 need_local_assets() {
     if [[ -f "${API_SOURCE}" ]]; then
+        python3 -m py_compile "${API_SOURCE}" >/dev/null 2>&1 || \
+            abort "Local companion API file is not valid Python: ${API_SOURCE}"
         return 0
     fi
 
@@ -59,6 +69,9 @@ need_local_assets() {
     if [[ ! -s "${DOWNLOADED_API_SOURCE}" ]]; then
         abort "Downloaded companion API file is empty: ${REMOTE_API_SOURCE_URL}"
     fi
+
+    python3 -m py_compile "${DOWNLOADED_API_SOURCE}" >/dev/null 2>&1 || \
+        abort "Downloaded companion API file is not valid Python: ${REMOTE_API_SOURCE_URL}"
 
     API_SOURCE="${DOWNLOADED_API_SOURCE}"
     echo "Downloaded companion API file from ${REMOTE_API_SOURCE_URL}"
@@ -179,7 +192,7 @@ setup_easy_rsa() {
     EASYRSA_BATCH=1 ./easyrsa gen-crl
     popd >/dev/null
 
-    install -d -m 750 /etc/openvpn/server
+    install -d -m 755 /etc/openvpn/server
     install -m 644 /etc/openvpn/easy-rsa/pki/ca.crt /etc/openvpn/server/ca.crt
     install -m 644 "/etc/openvpn/easy-rsa/pki/issued/${SERVER_COMMON_NAME}.crt" /etc/openvpn/server/server.crt
     install -m 600 "/etc/openvpn/easy-rsa/pki/private/${SERVER_COMMON_NAME}.key" /etc/openvpn/server/server.key
@@ -323,6 +336,8 @@ EOF
 initialize_manager_state() {
     /usr/bin/python3 /opt/paymenter-openvpn-manager/openvpn_manager_api.py init-db
 
+    chmod 755 /etc/openvpn
+    chmod 755 /etc/openvpn/server
     chown root:root /etc/openvpn/server/ccd
     chmod 755 /etc/openvpn/server/ccd
     find /etc/openvpn/server/ccd -maxdepth 1 -type f -exec chown root:root {} \;
@@ -342,12 +357,44 @@ initialize_manager_state() {
         chmod 664 /var/lib/paymenter-openvpn-manager/manager.db*
     fi
 
-    chown root:root /etc/openvpn/server/crl.pem
-    chmod 644 /etc/openvpn/server/crl.pem
+    if [[ -f /etc/openvpn/server/crl.pem ]]; then
+        chown root:root /etc/openvpn/server/crl.pem
+        chmod 644 /etc/openvpn/server/crl.pem
+    fi
     chown root:root /etc/paymenter-openvpn-manager
     chmod 755 /etc/paymenter-openvpn-manager
     chown root:root /etc/paymenter-openvpn-manager/config.json
     chmod 644 /etc/paymenter-openvpn-manager/config.json
+}
+
+verify_installation_prereqs() {
+    local required_paths=(
+        /etc/paymenter-openvpn-manager/config.json
+        /opt/paymenter-openvpn-manager/openvpn_manager_api.py
+        /opt/paymenter-openvpn-manager/client-connect.sh
+        /opt/paymenter-openvpn-manager/client-disconnect.sh
+        /etc/openvpn/server/server.conf
+        /etc/openvpn/server/ca.crt
+        /etc/openvpn/server/server.crt
+        /etc/openvpn/server/server.key
+        /etc/openvpn/server/crl.pem
+        /etc/openvpn/server/tls-crypt.key
+        /var/lib/paymenter-openvpn-manager/manager.db
+    )
+    local path=""
+
+    for path in "${required_paths[@]}"; do
+        [[ -e "${path}" ]] || abort "Required installation artifact is missing: ${path}"
+    done
+
+    runuser -u nobody -g nogroup -- test -r /etc/paymenter-openvpn-manager/config.json || \
+        abort "OpenVPN hook user cannot read /etc/paymenter-openvpn-manager/config.json"
+    runuser -u nobody -g nogroup -- test -r /etc/openvpn/server/crl.pem || \
+        abort "OpenVPN hook user cannot read /etc/openvpn/server/crl.pem"
+    runuser -u nobody -g nogroup -- test -x /etc/openvpn/server/ccd || \
+        abort "OpenVPN hook user cannot traverse /etc/openvpn/server/ccd"
+    runuser -u nobody -g nogroup -- /usr/bin/python3 /opt/paymenter-openvpn-manager/openvpn_manager_api.py connect-check __installer_probe__ >/dev/null 2>&1 || \
+        abort "OpenVPN hook preflight failed; verify config and runtime permissions."
 }
 
 configure_sysctl() {
@@ -617,10 +664,11 @@ install -d -m 755 /var/www/html/.well-known
 install -d -m 755 /var/www/html/.well-known/acme-challenge
 write_manager_assets
 write_manager_config
-initialize_manager_state
 configure_sysctl
 setup_easy_rsa
 write_openvpn_server_config
+initialize_manager_state
+verify_installation_prereqs
 
 echo "Configuring services and reverse proxy..."
 enable_services
@@ -636,9 +684,5 @@ fi
 systemctl restart openvpn-server@server.service
 systemctl restart paymenter-openvpn-api.service
 systemctl restart nginx
-
-if [[ -n "${DOWNLOADED_API_SOURCE}" && -f "${DOWNLOADED_API_SOURCE}" ]]; then
-    rm -f "${DOWNLOADED_API_SOURCE}"
-fi
 
 print_summary
