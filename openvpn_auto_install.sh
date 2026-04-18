@@ -243,6 +243,7 @@ sndbuf 0
 rcvbuf 0
 push "sndbuf 0"
 push "rcvbuf 0"
+push "topology subnet"
 ${explicit_exit}
 EOF
 }

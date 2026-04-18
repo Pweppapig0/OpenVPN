@@ -367,7 +367,6 @@ def build_client_config(common_name: str, row: dict) -> str:
     lines = [
         "client",
         "dev tun",
-        "topology subnet",
         f"proto {cfg['protocol']}",
         f"remote {cfg['public_host']} {cfg['port']}",
         "nobind",
